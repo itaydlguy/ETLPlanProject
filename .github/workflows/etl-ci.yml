@@ -1,0 +1,51 @@
+name: ETL pipeline (real stack)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run the pipeline end-to-end
+        run: |
+          set -e
+          if ls *.zip >/dev/null 2>&1; then unzip -o *.zip -d _unzipped >/dev/null; fi
+          DIR="$(dirname "$(find . -name docker-compose.yml | head -1)")"
+          echo "Project dir: $DIR"
+          cd "$DIR"
+          cp .env.example .env || true
+          mkdir -p "$GITHUB_WORKSPACE/_artifacts"
+          docker compose build
+          docker compose up -d postgres mongo airflow-init
+          for i in $(seq 1 40); do
+            docker compose exec -T postgres pg_isready -U airflow >/dev/null 2>&1 && break || sleep 3
+          done
+          docker compose up -d airflow-scheduler airflow-webserver
+          sleep 15
+          docker compose run --rm mongo-seed --reset
+          docker compose exec -T airflow-scheduler airflow dags unpause mongo_to_postgres_etl || true
+          docker compose exec -T airflow-scheduler airflow dags trigger mongo_to_postgres_etl
+          ok=0
+          for i in $(seq 1 60); do
+            out="$(docker compose exec -T airflow-scheduler airflow dags list-runs -d mongo_to_postgres_etl 2>/dev/null || true)"
+            echo "$out" | grep -q success && { ok=1; echo "DAG success"; break; }
+            if echo "$out" | grep -q failed; then echo "DAG failed"; docker compose logs airflow-scheduler | tail -150; exit 1; fi
+            sleep 10
+          done
+          [ "$ok" = "1" ] || { echo "Timed out"; docker compose logs airflow-scheduler | tail -150; exit 1; }
+          cat sql/validation_queries.sql | docker compose exec -T postgres psql -U airflow -d warehouse | tee "$GITHUB_WORKSPACE/_artifacts/validation_output.txt"
+          docker compose cp mongo/insight_queries.js mongo:/tmp/q.js || true
+          docker compose exec -T mongo mongosh -u root -p example --authenticationDatabase admin source --file /tmp/q.js 2>/dev/null | tee "$GITHUB_WORKSPACE/_artifacts/mongo_output.txt" || true
+          echo "SELECT * FROM etl_run_audit ORDER BY run_ts;" | docker compose exec -T postgres psql -U airflow -d warehouse | tee "$GITHUB_WORKSPACE/_artifacts/etl_run_audit.txt"
+
+      - name: Upload proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-proof
+          path: _artifacts/

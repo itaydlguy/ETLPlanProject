@@ -16,7 +16,6 @@ jobs:
           set -e
           if ls *.zip >/dev/null 2>&1; then unzip -o *.zip -d _unzipped >/dev/null; fi
           DIR="$(dirname "$(find . -name docker-compose.yml | head -1)")"
-          echo "Project dir: $DIR"
           cd "$DIR"
           cp .env.example .env || true
           chmod -R a+rX .
@@ -28,8 +27,13 @@ jobs:
             docker compose exec -T postgres pg_isready -U airflow >/dev/null 2>&1 && break || sleep 3
           done
           docker compose up -d airflow-scheduler airflow-webserver
-          sleep 20
           docker compose run --rm mongo-seed
+          echo "Waiting for the DAG to be registered..."
+          for i in $(seq 1 40); do
+            docker compose exec -T airflow-scheduler airflow dags list 2>/dev/null | grep -q mongo_to_postgres_etl && { echo "DAG registered"; break; }
+            sleep 5
+          done
+          docker compose exec -T airflow-scheduler airflow dags reserialize 2>/dev/null || true
           docker compose exec -T airflow-scheduler airflow dags unpause mongo_to_postgres_etl || true
           docker compose exec -T airflow-scheduler airflow dags trigger mongo_to_postgres_etl
           ok=0
